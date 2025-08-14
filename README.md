@@ -1,3 +1,4 @@
+
 project/
 │
 ├── data/                     # Dados de entrada / saída (brutos e processados)
