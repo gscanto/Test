@@ -1,0 +1,557 @@
+"""
+N-BEATS (TensorFlow) - Modular implementation for zero-shot + fine-tuning
+Author: ChatGPT (adapted for user request)
+
+Features:
+- Keras implementation of N-BEATS stacks (generic / trend / seasonality)
+- Data utilities to prepare long-format datasets (unique_id, ds, y)
+- Sliding-window dataset generator for global training on many series
+- Training (pretrain), fine-tuning, zero-shot prediction
+- Robust per-series scaling (median/IQR) with fallback to sklearn RobustScaler
+- Logging with loguru and structured error handling
+
+Requirements:
+- tensorflow (>=2.10)
+- pandas, numpy
+- loguru
+- (optional) scikit-learn for RobustScaler; if not installed, a simple scaler is used
+
+Usage examples (CLI):
+> python nbeats_tensorflow.py --mode train --data path/to/data.parquet --output checkpoints/nbeats_tf
+> python nbeats_tensorflow.py --mode predict --data path/to/one_series.csv --checkpoint checkpoints/nbeats_tf/weights.h5
+
+This file is modular: import functions/classes or run as script.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+import argparse
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+from loguru import logger
+
+# Optional sklearn scaler
+try:
+    from sklearn.preprocessing import RobustScaler
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
+
+# ----------------------------
+# Logging configuration
+# ----------------------------
+logger.remove()
+logger.add(lambda msg: print(msg, end=''), level='INFO')
+logger.add("nbeats_tf.log", rotation="10 MB", level='DEBUG')
+
+# ----------------------------
+# Exceptions
+# ----------------------------
+class NBeatsError(Exception):
+    pass
+
+# ----------------------------
+# Utilities: dataframe preparation
+# ----------------------------
+
+def ensure_month_end(ds_series: pd.Series) -> pd.Series:
+    """Convert datetimes to month-end timestamps."""
+    try:
+        return pd.to_datetime(ds_series).dt.to_period('M').dt.to_timestamp('M')
+    except Exception as e:
+        logger.exception("Erro ao converter coluna ds para final de mês")
+        raise NBeatsError("invalid ds column; must be convertible to datetime") from e
+
+
+def prepare_long_dataframe(df: pd.DataFrame, unique_id_col: str = 'unique_id', ds_col: str = 'ds', y_col: str = 'y') -> pd.DataFrame:
+    """Validate and normalize dataframe to required long format.
+
+    - Ensures required columns exist
+    - Converts ds to month-end timestamps
+    - Sorts by unique_id and ds
+    """
+    logger.info("Preparando dataframe long format")
+    required = {unique_id_col, ds_col, y_col}
+    if not required.issubset(df.columns):
+        logger.error("Dataframe missing required columns: %s", required - set(df.columns))
+        raise NBeatsError(f"Dataframe must contain columns: {required}")
+
+    df = df.copy()
+    df[ds_col] = ensure_month_end(df[ds_col])
+    df = df.sort_values([unique_id_col, ds_col]).reset_index(drop=True)
+    return df
+
+# ----------------------------
+# Simple per-series scaler (fallback)
+# ----------------------------
+class RobustSeriesScaler:
+    """Per-series robust scaler using median and IQR. Works as a fallback if sklearn is absent."""
+    def __init__(self):
+        self.params: Dict[str, Tuple[float, float]] = {}
+
+    def fit_series(self, series: np.ndarray, uid: str):
+        med = np.nanmedian(series)
+        q1 = np.nanpercentile(series, 25)
+        q3 = np.nanpercentile(series, 75)
+        iqr = q3 - q1
+        if iqr == 0:
+            iqr = 1.0
+        self.params[uid] = (med, iqr)
+        return self.params[uid]
+
+    def transform_series(self, series: np.ndarray, uid: str) -> np.ndarray:
+        if uid not in self.params:
+            self.fit_series(series, uid)
+        med, iqr = self.params[uid]
+        return (series - med) / iqr
+
+    def inverse_transform(self, series: np.ndarray, uid: str) -> np.ndarray:
+        if uid not in self.params:
+            raise NBeatsError(f"Scaler parameters for {uid} not found")
+        med, iqr = self.params[uid]
+        return series * iqr + med
+
+# ----------------------------
+# Dataset generation (sliding windows)
+# ----------------------------
+
+def create_windowed_dataset_long(
+    df: pd.DataFrame,
+    input_size: int,
+    horizon: int,
+    unique_id_col: str = 'unique_id',
+    ds_col: str = 'ds',
+    y_col: str = 'y',
+    batch_size: int = 256,
+    shuffle: bool = True,
+    scaler: Optional[object] = None,
+):
+    """Yield tf.data.Dataset for training a global model from long-format df.
+
+    Each window yields (past_x, future_y) where:
+      past_x: [input_size] - normalized past targets
+      future_y: [horizon]
+
+    Optionally supports exogenous features in future implementation.
+    """
+    logger.info("Criando dataset por janelas: input=%d horizon=%d", input_size, horizon)
+    groups = df.groupby(unique_id_col)
+
+    X_list = []
+    Y_list = []
+    ids = []
+
+    for uid, g in groups:
+        y = g[y_col].values.astype(float)
+        if len(y) < 1:
+            continue
+
+        # Fit per-series scaler when provided
+        if scaler is not None:
+            try:
+                if _HAS_SKLEARN and isinstance(scaler, RobustScaler):
+                    scaler.fit(y.reshape(-1, 1))
+                    y_scaled = scaler.transform(y.reshape(-1, 1)).squeeze()
+                else:
+                    scaler.fit_series(y, uid)
+                    y_scaled = scaler.transform_series(y, uid)
+            except Exception:
+                logger.exception("Erro ao escalar série %s, caindo para transform simples", uid)
+                y_scaled = (y - np.nanmedian(y)) / (np.nanpercentile(y,75)-np.nanpercentile(y,25) + 1e-6)
+        else:
+            # simple normalization by mean/std
+            mean = np.nanmean(y) if np.isfinite(np.nanmean(y)) else 0.0
+            std = np.nanstd(y) if np.isfinite(np.nanstd(y)) and np.nanstd(y) > 0 else 1.0
+            y_scaled = (y - mean) / std
+
+        # create sliding windows
+        total = len(y_scaled)
+        max_start = total - input_size - horizon + 1
+        if max_start <= 0:
+            # series shorter than input+horizon -> skip or create single padded window
+            # we create a single padded window (right aligned)
+            pad_len = input_size + horizon - total
+            y_pad = np.concatenate([np.full(pad_len, np.nan), y_scaled])
+            x = y_pad[:input_size]
+            y_target = y_pad[input_size:input_size+horizon]
+            # fill nan with last observed
+            x = np.nan_to_num(x, nan=np.nanmean(x) if np.isfinite(np.nanmean(x)) else 0.0)
+            y_target = np.nan_to_num(y_target, nan=0.0)
+            X_list.append(x)
+            Y_list.append(y_target)
+            ids.append(uid)
+            continue
+
+        for i in range(max_start):
+            x = y_scaled[i:i+input_size]
+            y_target = y_scaled[i+input_size:i+input_size+horizon]
+            if np.any(np.isnan(x)) or np.any(np.isnan(y_target)):
+                continue
+            X_list.append(x)
+            Y_list.append(y_target)
+            ids.append(uid)
+
+    if len(X_list) == 0:
+        raise NBeatsError("Nenhuma janela foi gerada. Verifique input_size e horizon em relação ao comprimento das séries.")
+
+    X = np.stack(X_list, axis=0)
+    Y = np.stack(Y_list, axis=0)
+
+    ds = tf.data.Dataset.from_tensor_slices((X.astype(np.float32), Y.astype(np.float32)))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=min(len(X), 10000))
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    logger.info("Dataset gerado com %d janelas (batches=%d)", len(X), math.ceil(len(X)/batch_size))
+    return ds
+
+# ----------------------------
+# N-BEATS blocks and model
+# ----------------------------
+
+def build_fc_block(input_dim: int, hidden_dim: int, n_layers: int, activation='relu') -> keras.Sequential:
+    layers_list = []
+    for _ in range(n_layers):
+        layers_list.append(layers.Dense(hidden_dim, activation=activation))
+    layers_list.append(layers.Dense(input_dim, activation=None))
+    return keras.Sequential(layers_list)
+
+
+class NBeatsBlock(layers.Layer):
+    """Single N-BEATS block producing backcast and forecast via basis.
+
+    This implementation supports three block types: 'generic', 'trend', 'seasonality'.
+    """
+    def __init__(self, input_size: int, theta_size: int, n_layers: int, n_hidden: int, block_type: str = 'generic'):
+        super().__init__()
+        self.block_type = block_type
+        self.fc = build_fc_block(input_size, n_hidden, n_layers)
+        self.theta_dense = layers.Dense(theta_size, activation=None)
+
+        # basis functions
+        if block_type == 'trend':
+            # polynomial basis up to degree theta_size-1
+            self.backcast_basis = self._trend_basis(input_size, theta_size)
+            self.forecast_basis = self._trend_basis(theta_size, theta_size)
+        elif block_type == 'seasonality':
+            # harmonic basis
+            self.backcast_basis = self._seasonality_basis(input_size, theta_size)
+            self.forecast_basis = self._seasonality_basis(theta_size, theta_size)
+        else:
+            self.backcast_basis = None
+            self.forecast_basis = None
+
+    def _trend_basis(self, length: int, degree: int) -> tf.Tensor:
+        t = np.linspace(0, 1, length)
+        basis = np.vstack([t**i for i in range(degree)])
+        return tf.constant(basis.astype(np.float32))  # shape (degree, length)
+
+    def _seasonality_basis(self, length: int, harmonics: int) -> tf.Tensor:
+        t = np.linspace(0, 2 * np.pi, length, endpoint=False)
+        basis = []
+        for i in range(1, harmonics+1):
+            basis.append(np.cos(i * t))
+            basis.append(np.sin(i * t))
+        basis = np.vstack(basis)  # shape (2*harmonics, length)
+        return tf.constant(basis.astype(np.float32))
+
+    def call(self, x):
+        # x shape: (batch, input_size)
+        x_fc = self.fc(x)
+        theta = self.theta_dense(x_fc)
+
+        if self.block_type == 'generic' or self.backcast_basis is None:
+            # generic: directly split theta into backcast and forecast sizes
+            # assume theta_size = input_size + forecast_size
+            half = theta.shape[-1] // 2
+            backcast = theta[..., :half]
+            forecast = theta[..., half:]
+            return backcast, forecast
+
+        # structured blocks
+        theta = tf.transpose(theta, perm=[0,1]) if len(theta.shape) == 3 else theta
+        # for stability, ensure shapes
+        # theta shape: (batch, theta_size)
+        # backcast = theta @ basis_backcast
+        backcast = tf.linalg.matmul(theta, self.backcast_basis)
+        forecast = tf.linalg.matmul(theta, self.forecast_basis)
+        return backcast, forecast
+
+
+class NBeatsNet(keras.Model):
+    def __init__(
+        self,
+        input_size: int,
+        horizon: int,
+        stack_types: List[str] = None,
+        nb_blocks_per_stack: int = 3,
+        n_layers: int = 2,
+        n_hidden: int = 512,
+    ):
+        super().__init__()
+        if stack_types is None:
+            stack_types = ['generic'] * 3
+        self.input_size = input_size
+        self.horizon = horizon
+        self.stacks = []
+
+        for stype in stack_types:
+            blocks = []
+            for _ in range(nb_blocks_per_stack):
+                if stype == 'generic':
+                    theta_size = input_size + horizon
+                elif stype == 'trend':
+                    # choose small theta for trend
+                    theta_size = 3
+                elif stype == 'seasonality':
+                    theta_size = min(horizon // 2, 6)  # number of harmonics
+                else:
+                    theta_size = input_size + horizon
+                block = NBeatsBlock(input_size=input_size, theta_size=theta_size, n_layers=n_layers, n_hidden=n_hidden, block_type=stype)
+                blocks.append(block)
+            self.stacks.append(blocks)
+
+    def call(self, x, training=False):
+        # x shape: (batch, input_size)
+        residual = x
+        forecast_agg = tf.zeros((tf.shape(x)[0], self.horizon), dtype=tf.float32)
+
+        for stack in self.stacks:
+            for block in stack:
+                backcast, forecast = block(residual)
+                # if backcast size != input_size, try to align
+                if backcast.shape[-1] != self.input_size:
+                    # project or pad/truncate
+                    backcast = tf.image.resize(tf.expand_dims(backcast, -1), (self.input_size, 1))
+                    backcast = tf.squeeze(backcast, -1)
+                residual = residual - backcast
+                # align forecast size
+                if forecast.shape[-1] != self.horizon:
+                    # project or pad/truncate
+                    forecast = tf.image.resize(tf.expand_dims(forecast, -1), (self.horizon,1))
+                    forecast = tf.squeeze(forecast, -1)
+                forecast_agg = forecast_agg + forecast
+        return forecast_agg
+
+# ----------------------------
+# Training, fine-tuning and prediction wrappers
+# ----------------------------
+
+def compile_and_fit(
+    model: keras.Model,
+    train_ds: tf.data.Dataset,
+    val_ds: Optional[tf.data.Dataset] = None,
+    lr: float = 1e-3,
+    max_epochs: int = 100,
+    output_dir: str = 'checkpoints',
+    monitor: str = 'val_loss',
+):
+    os.makedirs(output_dir, exist_ok=True)
+    ckpt_path = os.path.join(output_dir, 'weights.h5')
+
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss='mae', metrics=[tf.keras.metrics.MeanAbsolutePercentageError()])
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(ckpt_path, save_best_only=True, monitor=monitor, save_weights_only=True),
+        keras.callbacks.EarlyStopping(monitor=monitor, patience=10, restore_best_weights=True),
+        keras.callbacks.ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=5, min_lr=1e-6),
+    ]
+
+    try:
+        history = model.fit(train_ds, validation_data=val_ds, epochs=max_epochs, callbacks=callbacks)
+    except Exception as e:
+        logger.exception("Erro durante o treinamento: %s", e)
+        raise NBeatsError("Erro no fit do modelo") from e
+
+    logger.info("Treinamento concluído. Checkpoint salvo em %s", ckpt_path)
+    return history, ckpt_path
+
+
+def train_global(
+    df: pd.DataFrame,
+    input_size: int = 48,
+    horizon: int = 12,
+    stack_types: List[str] = None,
+    nb_blocks_per_stack: int = 3,
+    n_layers: int = 2,
+    n_hidden: int = 256,
+    batch_size: int = 256,
+    max_epochs: int = 100,
+    val_size: int = 12,
+    output_dir: str = 'checkpoints',
+):
+    """Prepare data, build model and train globally on all series in df."""
+    df = prepare_long_dataframe(df)
+
+    # build scaler
+    if _HAS_SKLEARN:
+        scaler = RobustScaler()
+        logger.info("Usando sklearn RobustScaler para normalização")
+    else:
+        scaler = RobustSeriesScaler()
+        logger.info("Usando scaler interno (fallback)")
+
+    train_ds = create_windowed_dataset_long(df, input_size=input_size, horizon=horizon, batch_size=batch_size, scaler=scaler)
+
+    # simple val split: use last val_size months from each series to create validation windows
+    # For simplicity, we reuse entire dataset as validation if val_size==0
+    val_ds = None
+
+    model = NBeatsNet(input_size=input_size, horizon=horizon, stack_types=stack_types, nb_blocks_per_stack=nb_blocks_per_stack, n_layers=n_layers, n_hidden=n_hidden)
+
+    logger.info("Iniciando treinamento global do N-BEATS (TensorFlow)")
+    history, ckpt = compile_and_fit(model, train_ds, val_ds, lr=1e-3, max_epochs=max_epochs, output_dir=output_dir)
+    return model, history, ckpt
+
+
+def fine_tune(
+    base_checkpoint: str,
+    df_subset: pd.DataFrame,
+    input_size: int = 48,
+    horizon: int = 12,
+    lr: float = 3e-4,
+    max_epochs: int = 50,
+    output_dir: str = 'checkpoints/ft',
+    **model_kwargs,
+):
+    """Fine-tune a pretrained checkpoint on df_subset (subset of series).
+
+    base_checkpoint: path to weights.h5 saved by train_global
+    """
+    if not os.path.exists(base_checkpoint):
+        logger.error("Checkpoint não encontrado em %s", base_checkpoint)
+        raise NBeatsError("Checkpoint pré-treinado não encontrado")
+
+    df_subset = prepare_long_dataframe(df_subset)
+    if _HAS_SKLEARN:
+        scaler = RobustScaler()
+    else:
+        scaler = RobustSeriesScaler()
+
+    train_ds = create_windowed_dataset_long(df_subset, input_size=input_size, horizon=horizon, batch_size=64, scaler=scaler)
+
+    model = NBeatsNet(input_size=input_size, horizon=horizon, **model_kwargs)
+    # build model by calling once
+    dummy = tf.zeros((1, input_size), dtype=tf.float32)
+    model(dummy)
+    model.load_weights(base_checkpoint)
+
+    logger.info("Iniciando fine-tuning (LR=%g) no subconjunto", lr)
+    history, ckpt = compile_and_fit(model, train_ds, val_ds=None, lr=lr, max_epochs=max_epochs, output_dir=output_dir)
+    return model, history, ckpt
+
+
+def predict_zero_shot(model: keras.Model, series: np.ndarray, scaler=None, input_size: int = 48, horizon: int = 12) -> np.ndarray:
+    """Predict horizon steps for a single series in zero-shot mode.
+
+    series: raw y values (1D). scaler: if provided, must have transform_series and inverse_transform methods or be sklearn scaler.
+    """
+    try:
+        y = np.asarray(series).astype(float)
+        # prepare last input_size values
+        if len(y) < input_size:
+            pad = input_size - len(y)
+            y_in = np.concatenate([np.full(pad, np.nanmean(y) if len(y)>0 else 0.0), y])
+        else:
+            y_in = y[-input_size:]
+
+        # scale
+        uid = 'single'
+        if scaler is not None:
+            if _HAS_SKLEARN and isinstance(scaler, RobustScaler):
+                y_in_s = scaler.transform(y_in.reshape(-1,1)).squeeze()
+            else:
+                if hasattr(scaler, 'fit_series'):
+                    scaler.fit_series(y, uid)
+                    y_in_s = scaler.transform_series(y_in, uid)
+                else:
+                    y_in_s = (y_in - np.nanmedian(y_in)) / (np.nanpercentile(y_in,75)-np.nanpercentile(y_in,25)+1e-6)
+        else:
+            mean = np.nanmean(y_in) if np.isfinite(np.nanmean(y_in)) else 0.0
+            std = np.nanstd(y_in) if np.isfinite(np.nanstd(y_in)) and np.nanstd(y_in)>0 else 1.0
+            y_in_s = (y_in - mean) / std
+
+        x = y_in_s.reshape((1,-1)).astype(np.float32)
+        preds = model.predict(x)
+        preds = preds.reshape(-1)
+
+        # inverse scale
+        if scaler is not None:
+            if _HAS_SKLEARN and isinstance(scaler, RobustScaler):
+                y_pred = scaler.inverse_transform(preds.reshape(-1,1)).squeeze()
+            else:
+                y_pred = scaler.inverse_transform(preds, uid)
+        else:
+            y_pred = preds * (np.nanstd(y_in) if np.nanstd(y_in)>0 else 1.0) + (np.nanmean(y_in) if np.isfinite(np.nanmean(y_in)) else 0.0)
+
+        return y_pred
+    except Exception as e:
+        logger.exception("Erro na predição zero-shot: %s", e)
+        raise NBeatsError("Erro na predição") from e
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def _parse_args():
+    p = argparse.ArgumentParser(description='N-BEATS TensorFlow - treinamento e predição')
+    p.add_argument('--mode', choices=['train', 'predict', 'finetune'], required=True)
+    p.add_argument('--data', type=str, help='Caminho para arquivo CSV/Parquet com dados (long format)')
+    p.add_argument('--checkpoint', type=str, help='Checkpoint weights.h5 para predict/finetune')
+    p.add_argument('--output', type=str, default='checkpoints', help='Pasta para salvar checkpoints')
+    p.add_argument('--input_size', type=int, default=48)
+    p.add_argument('--horizon', type=int, default=12)
+    return p.parse_args()
+
+
+def main():
+    args = _parse_args()
+    if args.mode == 'train':
+        if not args.data:
+            raise SystemExit('Especifique --data para treinar')
+        if args.data.endswith('.parquet'):
+            df = pd.read_parquet(args.data)
+        else:
+            df = pd.read_csv(args.data)
+        model, history, ckpt = train_global(df, input_size=args.input_size, horizon=args.horizon, output_dir=args.output)
+        logger.info('Treinamento finalizado. Checkpoint: %s', ckpt)
+
+    elif args.mode == 'predict':
+        if not args.data or not args.checkpoint:
+            raise SystemExit('Especifique --data e --checkpoint para predict')
+        if args.data.endswith('.parquet'):
+            df = pd.read_parquet(args.data)
+        else:
+            df = pd.read_csv(args.data)
+        # load model skeleton and weights
+        model = NBeatsNet(input_size=args.input_size, horizon=args.horizon)
+        dummy = tf.zeros((1, args.input_size), dtype=tf.float32)
+        model(dummy)
+        model.load_weights(args.checkpoint)
+        # expect df to contain single series values in y column
+        series = df['y'].values
+        pred = predict_zero_shot(model, series, scaler=None, input_size=args.input_size, horizon=args.horizon)
+        print(pd.DataFrame({'ds_pred': pd.date_range(df['ds'].max()+pd.offsets.MonthEnd(1), periods=args.horizon, freq='M'), 'y_pred': pred}))
+
+    elif args.mode == 'finetune':
+        if not args.checkpoint or not args.data:
+            raise SystemExit('Especifique --checkpoint e --data para finetune')
+        if args.data.endswith('.parquet'):
+            df = pd.read_parquet(args.data)
+        else:
+            df = pd.read_csv(args.data)
+        model, history, ckpt = fine_tune(base_checkpoint=args.checkpoint, df_subset=df, input_size=args.input_size, horizon=args.horizon)
+        logger.info('Fine-tuning concluído. Checkpoint: %s', ckpt)
+
+
+if __name__ == '__main__':
+    main()
