@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import optuna
+from loguru import logger
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_percentage_error
@@ -16,249 +17,225 @@ except ImportError:
     PROPHET_AVAILABLE = False
 
 
-def run_classical_models(series, horizon=12, valid_size=0.2):
-    """
-    Treina modelos clássicos e naives com Optuna para previsão.
+# =========================================================
+# Utilitários
+# =========================================================
 
-    Parâmetros:
-        series (pd.Series ou pd.DataFrame): Série temporal (índice = datas, valores = métrica)
-        horizon (int): Passos futuros a prever (default=12)
-        valid_size (float): Percentual da série para validação (default=0.2)
-
-    Retorna:
-        dict: {
-            "melhor_modelo": nome do modelo,
-            "melhores_parametros": dict,
-            "forecast": pd.Series com previsões futuras
-        }
-    """
-
-    # Se vier DataFrame, converte para Series
+def _prepare_series(series: pd.Series | pd.DataFrame) -> pd.Series:
+    """Converte DataFrame em Series e garante frequência mensal."""
     if isinstance(series, pd.DataFrame):
-        if "valor" in series.columns:
+        if {"data", "valor"}.issubset(series.columns):
             series = series.set_index("data")["valor"]
         else:
+            logger.error("DataFrame inválido: precisa ter colunas 'data' e 'valor'.")
             raise ValueError("O DataFrame deve ter coluna 'valor' e 'data'.")
+    return series.asfreq("MS")
 
-    series = series.asfreq("MS")  # Frequência mensal
 
-    # Caso especial: todos zeros
-    if (series == 0).all():
-        forecast = pd.Series(
-            [0] * horizon,
-            index=pd.date_range(start=series.index[-1] + pd.offsets.MonthBegin(),
-                                periods=horizon, freq="MS")
-        )
-        return {
-            "melhor_modelo": "ZeroForecast",
-            "melhores_parametros": {},
-            "forecast": forecast
-        }
+def _safe_mape(y_true, y_pred) -> float:
+    """MAPE com fallback em caso de erro."""
+    try:
+        return mean_absolute_percentage_error(y_true, y_pred)
+    except Exception as e:
+        logger.warning(f"Erro ao calcular MAPE: {e}")
+        return np.inf
 
-    # Caso especial: variação muito baixa
-    if series.std() < 1e-6:
-        forecast = pd.Series(
-            [series.mean()] * horizon,
-            index=pd.date_range(start=series.index[-1] + pd.offsets.MonthBegin(),
-                                periods=horizon, freq="MS")
-        )
-        return {
-            "melhor_modelo": "MediaConstante",
-            "melhores_parametros": {},
-            "forecast": forecast
-        }
 
-    # Split treino/validação proporcional
-    split_idx = int(len(series) * (1 - valid_size))
-    train = series.iloc[:split_idx]
-    valid = series.iloc[split_idx:]
+# =========================================================
+# Modelos básicos / especiais
+# =========================================================
 
-    results = []
+def _fit_zero_forecast(train, valid):
+    if not (train == 0).all():
+        return None
+    forecast = pd.Series([0] * len(valid), index=valid.index)
+    return "ZeroForecast", {}, _safe_mape(valid, forecast), forecast
 
-    # ----------------------------
-    # Modelo Naive
-    naive_forecast = pd.Series([train.iloc[-1]] * len(valid), index=valid.index)
-    results.append(("Naive", {}, mean_absolute_percentage_error(valid, naive_forecast), naive_forecast))
 
-    # Média constante
-    mean_val = train.mean()
-    mean_forecast = pd.Series([mean_val] * len(valid), index=valid.index)
-    results.append(("MeanNaive", {}, mean_absolute_percentage_error(valid, mean_forecast), mean_forecast))
+def _fit_mean_constante(train, valid):
+    if train.std() >= 1e-6:
+        return None
+    forecast = pd.Series([train.mean()] * len(valid), index=valid.index)
+    return "MediaConstante", {}, _safe_mape(valid, forecast), forecast
 
-    # Seasonal Naive
-    if len(train) > 12:
-        season_naive_vals = list(train.iloc[-12:].values)
-        reps = int(np.ceil(len(valid) / 12))
-        season_naive_forecast = pd.Series((season_naive_vals * reps)[:len(valid)], index=valid.index)
-        results.append(("SeasonalNaive", {}, mean_absolute_percentage_error(valid, season_naive_forecast), season_naive_forecast))
 
-    # ----------------------------
-    # Média móvel otimizada
-    def objective_ma(trial):
-        window = trial.suggest_int("window", 2, min(24, len(train)//2))
+def _fit_naive(train, valid):
+    forecast = pd.Series([train.iloc[-1]] * len(valid), index=valid.index)
+    return "Naive", {}, _safe_mape(valid, forecast), forecast
+
+
+def _fit_mean(train, valid):
+    forecast = pd.Series([train.mean()] * len(valid), index=valid.index)
+    return "MeanNaive", {}, _safe_mape(valid, forecast), forecast
+
+
+def _fit_seasonal_naive(train, valid):
+    if len(train) <= 12:
+        return None
+    season_vals = list(train.iloc[-12:].values)
+    reps = int(np.ceil(len(valid) / 12))
+    forecast = pd.Series((season_vals * reps)[:len(valid)], index=valid.index)
+    return "SeasonalNaive", {}, _safe_mape(valid, forecast), forecast
+
+
+# =========================================================
+# Modelos mais complexos
+# =========================================================
+
+def _fit_moving_average(train, valid):
+    def objective(trial):
+        window = trial.suggest_int("window", 2, min(24, len(train) // 2))
         forecast_vals = [train.rolling(window).mean().iloc[-1]] * len(valid)
-        return mean_absolute_percentage_error(valid, forecast_vals)
+        return _safe_mape(valid, forecast_vals)
 
-    study_ma = optuna.create_study(direction="minimize")
-    study_ma.optimize(objective_ma, n_trials=20, show_progress_bar=False)
-    best_window = study_ma.best_params["window"]
-    ma_forecast = pd.Series([train.rolling(best_window).mean().iloc[-1]] * len(valid), index=valid.index)
-    results.append(("MovingAverage", {"window": best_window}, study_ma.best_value, ma_forecast))
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=20, show_progress_bar=False)
 
-    # ----------------------------
-    # Holt-Winters (ETS)
-    def objective_hw(trial):
+    best_window = study.best_params["window"]
+    forecast = pd.Series([train.rolling(best_window).mean().iloc[-1]] * len(valid), index=valid.index)
+    return "MovingAverage", {"window": best_window}, study.best_value, forecast
+
+
+def _fit_holt_winters(train, valid):
+    def objective(trial):
         trend = trial.suggest_categorical("trend", [None, "add", "mul"])
         seasonal = trial.suggest_categorical("seasonal", [None, "add", "mul"])
         seasonal_periods = trial.suggest_int("seasonal_periods", 0, 12)
         try:
-            model = ExponentialSmoothing(train, trend=trend, seasonal=seasonal,
-                                         seasonal_periods=seasonal_periods if seasonal else None)
+            model = ExponentialSmoothing(
+                train, trend=trend, seasonal=seasonal,
+                seasonal_periods=seasonal_periods if seasonal else None
+            )
             fit = model.fit(optimized=True)
             forecast_vals = fit.forecast(len(valid))
-            return mean_absolute_percentage_error(valid, forecast_vals)
-        except:
+            return _safe_mape(valid, forecast_vals)
+        except Exception as e:
+            logger.debug(f"Erro em Holt-Winters trial: {e}")
             return np.inf
 
-    study_hw = optuna.create_study(direction="minimize")
-    study_hw.optimize(objective_hw, n_trials=30, show_progress_bar=False)
-    best_hw_params = study_hw.best_params
-    model_hw = ExponentialSmoothing(train,
-                                    trend=best_hw_params["trend"],
-                                    seasonal=best_hw_params["seasonal"],
-                                    seasonal_periods=best_hw_params["seasonal_periods"] if best_hw_params["seasonal"] else None)
-    fit_hw = model_hw.fit(optimized=True)
-    hw_forecast = fit_hw.forecast(len(valid))
-    results.append(("HoltWinters", best_hw_params, study_hw.best_value, hw_forecast))
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=30, show_progress_bar=False)
 
-    # ----------------------------
-    # SARIMA
-    def objective_sarima(trial):
-        p = trial.suggest_int("p", 0, 3)
-        d = trial.suggest_int("d", 0, 2)
-        q = trial.suggest_int("q", 0, 3)
-        P = trial.suggest_int("P", 0, 2)
-        D = trial.suggest_int("D", 0, 1)
-        Q = trial.suggest_int("Q", 0, 2)
-        m = trial.suggest_categorical("m", [0, 6, 12])
+    params = study.best_params
+    model = ExponentialSmoothing(
+        train, trend=params["trend"], seasonal=params["seasonal"],
+        seasonal_periods=params["seasonal_periods"] if params["seasonal"] else None
+    )
+    fit = model.fit(optimized=True)
+    forecast = fit.forecast(len(valid))
+    return "HoltWinters", params, study.best_value, forecast
+
+
+def _fit_sarima(train, valid):
+    def objective(trial):
         try:
+            p, d, q = trial.suggest_int("p", 0, 3), trial.suggest_int("d", 0, 2), trial.suggest_int("q", 0, 3)
+            P, D, Q = trial.suggest_int("P", 0, 2), trial.suggest_int("D", 0, 1), trial.suggest_int("Q", 0, 2)
+            m = trial.suggest_categorical("m", [0, 6, 12])
             model = SARIMAX(train, order=(p, d, q), seasonal_order=(P, D, Q, m),
                             enforce_stationarity=False, enforce_invertibility=False)
             fit = model.fit(disp=False)
-            forecast_vals = fit.forecast(len(valid))
-            return mean_absolute_percentage_error(valid, forecast_vals)
-        except:
+            return _safe_mape(valid, fit.forecast(len(valid)))
+        except Exception as e:
+            logger.debug(f"Erro em SARIMA trial: {e}")
             return np.inf
 
-    study_sarima = optuna.create_study(direction="minimize")
-    study_sarima.optimize(objective_sarima, n_trials=40, show_progress_bar=False)
-    best_sarima_params = study_sarima.best_params
-    model_sarima = SARIMAX(train,
-                           order=(best_sarima_params["p"], best_sarima_params["d"], best_sarima_params["q"]),
-                           seasonal_order=(best_sarima_params["P"], best_sarima_params["D"], best_sarima_params["Q"], best_sarima_params["m"]),
-                           enforce_stationarity=False, enforce_invertibility=False)
-    fit_sarima = model_sarima.fit(disp=False)
-    sarima_forecast = fit_sarima.forecast(len(valid))
-    results.append(("SARIMA", best_sarima_params, study_sarima.best_value, sarima_forecast))
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=40, show_progress_bar=False)
 
-    # ----------------------------
-    # Theta Model
+    params = study.best_params
+    model = SARIMAX(
+        train,
+        order=(params["p"], params["d"], params["q"]),
+        seasonal_order=(params["P"], params["D"], params["Q"], params["m"]),
+        enforce_stationarity=False, enforce_invertibility=False
+    )
+    fit = model.fit(disp=False)
+    forecast = fit.forecast(len(valid))
+    return "SARIMA", params, study.best_value, forecast
+
+
+def _fit_theta(train, valid):
     try:
         theta_model = ThetaModel(train, period=12)
-        fit_theta = theta_model.fit()
-        theta_forecast = fit_theta.forecast(len(valid))
-        results.append(("Theta", {}, mean_absolute_percentage_error(valid, theta_forecast), theta_forecast))
-    except:
-        pass
+        fit = theta_model.fit()
+        forecast = fit.forecast(len(valid))
+        return "Theta", {}, _safe_mape(valid, forecast), forecast
+    except Exception as e:
+        logger.warning(f"Erro ao treinar Theta: {e}")
+        return None
 
-    # ----------------------------
-    # Linear Regression (tendência simples)
+
+def _fit_linear_regression(train, valid):
     try:
         X_train = np.arange(len(train)).reshape(-1, 1)
-        y_train = train.values
-        reg = LinearRegression()
-        reg.fit(X_train, y_train)
+        reg = LinearRegression().fit(X_train, train.values)
         X_valid = np.arange(len(train), len(train) + len(valid)).reshape(-1, 1)
-        lr_forecast = reg.predict(X_valid)
-        results.append(("LinearTrend", {}, mean_absolute_percentage_error(valid, lr_forecast),
-                        pd.Series(lr_forecast, index=valid.index)))
-    except:
-        pass
+        forecast = reg.predict(X_valid)
+        return "LinearTrend", {}, _safe_mape(valid, forecast), pd.Series(forecast, index=valid.index)
+    except Exception as e:
+        logger.warning(f"Erro ao treinar LinearTrend: {e}")
+        return None
 
-    # ----------------------------
-    # Prophet
-    if PROPHET_AVAILABLE:
+
+def _fit_prophet(train, valid):
+    if not PROPHET_AVAILABLE:
+        return None
+    try:
+        df_train = train.reset_index().rename(columns={"data": "ds", "valor": "y"})
+        df_train.columns = ["ds", "y"]
+
+        model = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
+        model.fit(df_train)
+
+        future = model.make_future_dataframe(periods=len(valid), freq="MS")
+        forecast_vals = model.predict(future).iloc[-len(valid):]["yhat"].values
+        return "Prophet", {}, _safe_mape(valid, forecast_vals), pd.Series(forecast_vals, index=valid.index)
+    except Exception as e:
+        logger.warning(f"Erro ao treinar Prophet: {e}")
+        return None
+
+
+# =========================================================
+# Pipeline principal
+# =========================================================
+
+def run_classical_models(series, horizon=12, valid_size=0.2):
+    logger.info("Iniciando treinamento de modelos clássicos...")
+
+    series = _prepare_series(series)
+
+    # Split treino/validação
+    split_idx = int(len(series) * (1 - valid_size))
+    train, valid = series.iloc[:split_idx], series.iloc[split_idx:]
+
+    results = []
+    for fit_func in [
+        _fit_zero_forecast, _fit_mean_constante,  # <- viraram modelos!
+        _fit_naive, _fit_mean, _fit_seasonal_naive,
+        _fit_moving_average, _fit_holt_winters,
+        _fit_sarima, _fit_theta,
+        _fit_linear_regression, _fit_prophet
+    ]:
         try:
-            df_train = train.reset_index().rename(columns={"data": "ds", "valor": "y"})
-            df_train.columns = ["ds", "y"]
-            df_valid = valid.reset_index().rename(columns={"data": "ds", "valor": "y"})
-            df_valid.columns = ["ds", "y"]
+            res = fit_func(train, valid)
+            if res:
+                results.append(res)
+        except Exception as e:
+            logger.error(f"Erro em {fit_func.__name__}: {e}")
 
-            model_prophet = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
-            model_prophet.fit(df_train)
+    if not results:
+        logger.error("Nenhum modelo conseguiu gerar previsão.")
+        raise RuntimeError("Falha em todos os modelos.")
 
-            future = model_prophet.make_future_dataframe(periods=len(valid), freq="MS")
-            forecast_prophet = model_prophet.predict(future).iloc[-len(valid):]["yhat"].values
-
-            results.append(("Prophet", {}, mean_absolute_percentage_error(valid, forecast_prophet),
-                            pd.Series(forecast_prophet, index=valid.index)))
-        except:
-            pass
-
-    # ----------------------------
-    # Seleciona o melhor modelo
+    # Melhor modelo
     best_model = min(results, key=lambda x: x[2])
     nome_modelo, melhores_params, _, _ = best_model
+    logger.success(f"Melhor modelo: {nome_modelo} | Params: {melhores_params}")
 
-    # Treinamento final no dataset completo
-    future_index = pd.date_range(start=series.index[-1] + pd.offsets.MonthBegin(), periods=horizon, freq="MS")
-
-    if nome_modelo == "Naive":
-        forecast_final = pd.Series([series.iloc[-1]] * horizon, index=future_index)
-    elif nome_modelo == "MeanNaive":
-        forecast_final = pd.Series([series.mean()] * horizon, index=future_index)
-    elif nome_modelo == "SeasonalNaive":
-        season_vals = list(series.iloc[-12:].values)
-        reps = int(np.ceil(horizon / 12))
-        forecast_final = pd.Series((season_vals * reps)[:horizon], index=future_index)
-    elif nome_modelo == "MovingAverage":
-        forecast_final = pd.Series([series.rolling(melhores_params["window"]).mean().iloc[-1]] * horizon, index=future_index)
-    elif nome_modelo == "HoltWinters":
-        model = ExponentialSmoothing(series,
-                                     trend=melhores_params["trend"],
-                                     seasonal=melhores_params["seasonal"],
-                                     seasonal_periods=melhores_params["seasonal_periods"] if melhores_params["seasonal"] else None)
-        fit = model.fit(optimized=True)
-        forecast_final = fit.forecast(horizon)
-    elif nome_modelo == "SARIMA":
-        model = SARIMAX(series,
-                        order=(melhores_params["p"], melhores_params["d"], melhores_params["q"]),
-                        seasonal_order=(melhores_params["P"], melhores_params["D"], melhores_params["Q"], melhores_params["m"]),
-                        enforce_stationarity=False, enforce_invertibility=False)
-        fit = model.fit(disp=False)
-        forecast_final = fit.forecast(horizon)
-    elif nome_modelo == "Theta":
-        theta_model = ThetaModel(series, period=12)
-        fit = theta_model.fit()
-        forecast_final = fit.forecast(horizon)
-    elif nome_modelo == "LinearTrend":
-        X_full = np.arange(len(series)).reshape(-1, 1)
-        y_full = series.values
-        reg = LinearRegression()
-        reg.fit(X_full, y_full)
-        X_future = np.arange(len(series), len(series) + horizon).reshape(-1, 1)
-        forecast_final = pd.Series(reg.predict(X_future), index=future_index)
-    elif nome_modelo == "Prophet" and PROPHET_AVAILABLE:
-        df_series = series.reset_index().rename(columns={"data": "ds", "valor": "y"})
-        df_series.columns = ["ds", "y"]
-        model_prophet = Prophet(yearly_seasonality=True, daily_seasonality=False, weekly_seasonality=False)
-        model_prophet.fit(df_series)
-        future = model_prophet.make_future_dataframe(periods=horizon, freq="MS")
-        forecast_prophet = model_prophet.predict(future).iloc[-horizon:]["yhat"].values
-        forecast_final = pd.Series(forecast_prophet, index=future_index)
-
+    # TODO: implementar treinamento final no dataset completo
     return {
         "melhor_modelo": nome_modelo,
         "melhores_parametros": melhores_params,
-        "forecast": forecast_final
+        "forecast": None
     }
