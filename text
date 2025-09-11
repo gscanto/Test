@@ -1,0 +1,93 @@
+Descrição do problema:
+
+Em produções de dispositivos
+
+
+
+
+
+Descrição da solução:
+
+Para realizar a previsão do **ASR** e do **CASR**, dividimos o problema em duas etapas: (i) previsão de vendas e (ii) previsão de defeitos. Como a previsão de vendas já é fornecida pela empresa a partir de informações internas, nosso foco está na previsão de defeitos para os próximos doze meses.
+
+Em vez de prever diretamente o número total de defeitos mensais ou acumulados, adotamos uma abordagem alternativa: prever a **média de defeitos diários por mês**. Essa escolha se justifica porque feriados (nacionais, estaduais e municipais) e finais de semana impactam a produção, as vendas e o funcionamento das assistências técnicas, influenciando diretamente a quantidade de defeitos.
+
+O processo inicia-se com o cálculo da média diária de defeitos em cada mês. Para isso, utilizamos os dados históricos de defeitos mensais em conjunto com a quantidade de dias úteis de cada mês — definidos como todos os dias que não correspondem a finais de semana nem a feriados.
+
+Com esse conjunto de médias diárias construído, aplicamos modelos estatísticos e de aprendizado de máquina para realizar a previsão. A seleção de hiperparâmetros para cada modelo é feita por meio do algoritmo de otimização **Tree-structured Parzen Estimator (TPE)**, que explora diferentes combinações e retorna, com base em métricas de desempenho como o **MAE (Mean Absolute Error)**, o melhor conjunto de configurações para cada modelo.
+
+Após a definição dos hiperparâmetros ideais, treinamos novamente os modelos utilizando todo o conjunto de dados e geramos as previsões para os doze meses seguintes. A partir das médias previstas de defeitos diários, multiplicamos cada valor pelo número de dias úteis do respectivo mês, obtendo assim a previsão do total de defeitos mensais.
+
+É importante destacar que o total mensal de defeitos resulta da soma dos defeitos do mês atual com os das onze produções anteriores ainda em período de garantia. Contudo, o modelo não prevê diretamente a distribuição de defeitos por produção. Para superar essa limitação, utilizamos a **distribuição histórica média dos últimos doze meses**, que indica a porcentagem de contribuição de cada produção para o total de defeitos. Assim, os defeitos previstos são redistribuídos entre as produções de acordo com essas proporções.
+
+Com os defeitos distribuídos por produção, calculamos então os defeitos acumulados necessários para a obtenção do **ASR** e do **CASR**, utilizando as Equações XX e YY, respectivamente.
+
+Por fim, combinamos as previsões de defeitos acumulados com as previsões de vendas acumuladas (também obtidas pelas Equações XX e YY). Dessa forma, obtemos as previsões dos KPIs **ASR** e **CASR** para os próximos doze meses.
+
+Metodologia:
+
+## Metodologia
+
+### Justificativa para a escolha dos modelos
+
+Foram selecionados modelos estatísticos e de aprendizado de máquina amplamente utilizados em previsão de séries temporais e regressão supervisionada.
+
+* **Modelos estatísticos (ETS, Holt-Winters, Prophet)** foram escolhidos por sua robustez na modelagem de tendências e sazonalidades, oferecendo uma linha de base interpretável.
+* **Modelos de aprendizado de máquina (Regressão Linear, Random Forest, XGBoost, CatBoost)** foram empregados pela flexibilidade em lidar com padrões não lineares e pela capacidade de incorporar variáveis exógenas.
+  Essa diversidade metodológica possibilita comparar abordagens clássicas e modernas, buscando o equilíbrio entre interpretabilidade e desempenho preditivo.
+
+### Métrica de avaliação
+
+A métrica adotada foi o **Mean Absolute Percentage Error (MAPE)**, que mede o erro percentual médio das previsões em relação aos valores observados. Sua escolha justifica-se por:
+(i) ser de fácil interpretação, uma vez que expressa o erro em termos percentuais;
+(ii) permitir comparações entre diferentes séries e modelos, independentemente da escala;
+(iii) ser amplamente utilizada em aplicações práticas de previsão, especialmente em contextos empresariais.
+
+Matematicamente, o **MAPE** é definido como:
+
+$$
+MAPE = \frac{100}{n} \sum_{t=1}^{n} \left| \frac{y_t - \hat{y}_t}{y_t} \right|
+$$
+
+em que:
+
+* $n$ representa o número de observações no conjunto de teste;
+* $y_t$ é o valor observado no instante $t$;
+* $\hat{y}_t$ é o valor previsto para o mesmo instante.
+
+O resultado do MAPE é dado em **percentual**, representando o erro médio relativo das previsões em relação aos valores reais.
+
+### Tecnologias e bibliotecas utilizadas
+
+Os experimentos foram conduzidos em **Python 3.12.7**, utilizando as seguintes bibliotecas principais:
+
+* **pandas** e **numpy** para manipulação de dados;
+* **scikit-learn** para regressão e validação;
+* **statsmodels** para ETS e Holt-Winters;
+* **prophet** para modelagem aditiva de séries temporais;
+* **xgboost** e **catboost** para boosting;
+* **optuna** para otimização de hiperparâmetros via TPE;
+* **matplotlib** e **seaborn** para visualização.
+
+### Ambiente de execução
+
+Os experimentos foram executados em uma estação de trabalho com as seguintes configurações:
+
+* **Processador:** Intel® Core™ i7-12700F (12 núcleos, 20 threads, até 4.9 GHz)
+* **Memória RAM:** 32 GB DDR4
+* **Armazenamento:** SSD NVMe 1 TB
+* **Sistema Operacional:** Ubuntu 22.04 LTS (64 bits)
+* **Versão do Python:** 3.12.7
+
+### Treinamento e validação dos modelos
+
+Adotou-se a técnica de **validação cruzada temporal com janela expandida (expanding window cross-validation)** para o treinamento e validação, garantindo o respeito à ordem cronológica e evitando **data leakage**.
+
+O procedimento seguiu os seguintes passos:
+
+1. Treinamento inicial em uma janela histórica;
+2. Validação em um período subsequente;
+3. Expansão progressiva da janela de treinamento para incluir novas observações;
+4. Repetição do processo até cobrir todo o período disponível.
+
+Após a busca de hiperparâmetros via TPE, os melhores parâmetros foram selecionados com base no **MAPE médio** obtido durante as iterações de validação. Em seguida, os modelos foram re-treinados em todo o histórico disponível até o último mês observado, e utilizados para gerar previsões para os doze meses seguintes.
